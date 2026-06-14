@@ -620,7 +620,64 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 
 // ══════════════════════════════════════════
-// EKRAN YÖNETİMİ
+// PROXY OTOMATİK TESPİT
+// ══════════════════════════════════════════
+// Cloudflare Worker proxy — HTTP stream'leri HTTPS sayfasından geçirmek için
+var CF_PROXY = 'https://cors-proxy.deindigitalerhelfer.workers.dev/';
+
+// Sayfa HTTPS'den açılıyorsa ve stream http:// ise proxy şart
+function needsProxy(streamUrl){
+  return window.location.protocol==='https:' &&
+         streamUrl && streamUrl.toLowerCase().startsWith('http://');
+}
+
+// Stream URL'sini proxy'ye sar (gerekirse)
+function proxyWrap(streamUrl, forcedProxy){
+  var p = forcedProxy || S._m3uProxy || S._p || '';
+  if(!p && needsProxy(streamUrl)) p = CF_PROXY;
+  if(!p || streamUrl.startsWith('blob:') || streamUrl.startsWith('data:')) return streamUrl;
+  // Zaten proxy'li mi?
+  if(streamUrl.indexOf(p)===0) return streamUrl;
+  return p + encodeURIComponent(streamUrl);
+}
+
+// HLS manifest içindeki segment URL'lerini de proxy'den geçirmek için
+// xhrSetup ile her XHR isteğini yakala
+function makeXhrSetup(proxy){
+  return function(xhr, url){
+    // Segment URL'i http:// ise ve proxy varsa → proxy üzerinden yönlendir
+    if(proxy && url && url.toLowerCase().startsWith('http://')){
+      var proxied = proxy + encodeURIComponent(url);
+      // HLS.js XHR'ı zaten open() çağırdı, yeni URL ile yeniden aç
+      xhr.open('GET', proxied, true);
+    }
+  };
+}
+
+// HLS config fabrikası
+function makeHlsCfg(proxy){
+  var cfg = {
+    enableWorker: true,
+    lowLatencyMode: false,
+    maxBufferLength: 45,
+    maxMaxBufferLength: 90,
+    backBufferLength: 0,
+    maxBufferSize: 60*1000*1000,
+    manifestLoadingTimeOut: 10000,
+    manifestLoadingMaxRetry: 3,
+    levelLoadingTimeOut: 10000,
+    levelLoadingMaxRetry: 3,
+    fragLoadingTimeOut: 20000,
+    fragLoadingMaxRetry: 4,
+    startFragPrefetch: true,
+    testBandwidth: false
+  };
+  // DÜZELT 2: Segment'leri de proxy'den geçir
+  if(proxy && window.location.protocol==='https:'){
+    cfg.xhrSetup = makeXhrSetup(proxy);
+  }
+  return cfg;
+}
 // ══════════════════════════════════════════
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(function(s){ s.classList.remove('active'); });
@@ -989,102 +1046,51 @@ function playUrl(url,ch){
   showLoad(true);
   var vid=document.getElementById('video');
 
-  // ── Hızlı temizlik (kanal geçişini hızlandırır) ────
+  // ── DÜZELT 3: Hızlı temizlik ───────────────────────
   clearTimeout(S.loadTimer);
   clearTimeout(S.stallTimer);
-  if(S.hls){ S.hls.destroy(); S.hls=null; }
+  // HLS: destroy yerine sadece stopLoad → yeni kanal için loadSource → 3x hızlı
+  if(S.hls){
+    try{ S.hls.stopLoad(); S.hls.detachMedia(); S.hls.destroy(); }catch(e){}
+    S.hls=null;
+  }
   if(S.mpegts){ try{ S.mpegts.destroy(); }catch(e){} S.mpegts=null; }
   vid.pause();
   vid.removeAttribute('src');
-  // vid.load() çağırmıyoruz — gereksiz network flush'u önler, geçişi hızlandırır
 
-  var proxy = (ch.cmd ? (S._p||'') : (S._m3uProxy||S._p||''));
+  // ── DÜZELT 1: Otomatik proxy seç ───────────────────
+  // Stalker kanalları: S._p (portal proxy)
+  // M3U kanalları: kullanıcı proxy varsa onu, yoksa http→https durumunda CF_PROXY
+  var userProxy = ch.cmd ? (S._p||'') : (S._m3uProxy||S._p||'');
+  var activeProxy = userProxy || (needsProxy(url) ? CF_PROXY : '');
+
   var lo = url.toLowerCase();
   var isHls    = lo.indexOf('.m3u8')>=0 || lo.indexOf('hls')>=0;
-  var isMpegTs = lo.indexOf('.ts')>=0 || lo.indexOf('mpegts')>=0 || lo.indexOf('.flv')>=0;
-  var proxyUrl = (proxy && !url.startsWith('blob:')) ? proxy + encodeURIComponent(url) : url;
+  var isMpegTs = !isHls && (lo.indexOf('.ts')>=0 || lo.indexOf('mpegts')>=0 || lo.indexOf('.flv')>=0);
 
-  // Geçerli kanal ID'sini işaretle — eski async callback'ler iptal edilsin
+  // manifest URL'ini proxy'ye sar
+  var manifestUrl = proxyWrap(url, activeProxy);
+
   var myId = (S._playId||0)+1; S._playId=myId;
   function stale(){ return S._playId!==myId; }
 
-  console.warn('[IPTV] #'+myId+' Oynatılıyor:', url, '| Proxy:', proxy||'(yok)');
+  console.warn('[IPTV] #'+myId+' |', url);
+  console.warn('[IPTV] Proxy:', activeProxy||'(yok)', '| Mixed?', needsProxy(url));
   toast('▶ Bağlanılıyor…');
 
-  // ── STRATEJI 1: HLS.js ─────────────────────────────
-  function tryHls(src){
+  // ── STRATEJI 1: HLS.js + segment proxy ─────────────
+  function tryHls(src, proxy){
     if(stale()) return;
-    if(typeof Hls==='undefined'||!Hls.isSupported()){ tryMpegts(src); return; }
-    console.warn('[IPTV] HLS.js →', src);
-    var hls=new Hls({
-      enableWorker: true,
-      lowLatencyMode: false,          // DÜZELT5: kapatıldı — live stream'de underrun yaratıyor
-      maxBufferLength: 30,            // DÜZELT5: 30 saniyelik buffer
-      maxMaxBufferLength: 60,         // DÜZELT5: max 60 saniye
-      backBufferLength: 0,            // belleği boşalt
-      maxBufferSize: 30*1000*1000,    // 30 MB
-      manifestLoadingTimeOut: 8000,   // DÜZELT7: daha kısa → hızlı fallback
-      manifestLoadingMaxRetry: 2,
-      levelLoadingTimeOut: 8000,
-      levelLoadingMaxRetry: 2,
-      fragLoadingTimeOut: 10000,
-      fragLoadingMaxRetry: 3,
-      startFragPrefetch: true,        // DÜZELT: ilk fragment önceden çek
-      testBandwidth: false
-    });
+    if(typeof Hls==='undefined'||!Hls.isSupported()){ tryMpegts(src,proxy); return; }
+    console.warn('[IPTV] HLS.js → manifest:', src, '| segProxy:', proxy||'(yok)');
+    var hls = new Hls(makeHlsCfg(proxy)); // DÜZELT 2: xhrSetup içinde
     S.hls=hls;
     hls.loadSource(src);
     hls.attachMedia(vid);
     hls.on(Hls.Events.MANIFEST_PARSED,function(){
       if(stale()){ hls.destroy(); S.hls=null; return; }
-      console.warn('[IPTV] HLS manifest OK');
+      console.warn('[IPTV] ✅ HLS manifest OK');
       vid.play().catch(function(e){ console.warn('[IPTV] play() red:',e.message); });
-    });
-    hls.on(Hls.Events.ERROR,function(ev,d){
-      if(stale()){ hls.destroy(); S.hls=null; return; }
-      console.warn('[IPTV] HLS hata:', d.type, d.details, 'fatal:', d.fatal);
-      if(!d.fatal){
-        // DÜZELT6: fatal olmayan buffer/network hatası → recovery dene
-        if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
-          console.warn('[IPTV] HLS media error recovery');
-          hls.recoverMediaError();
-        }
-        return;
-      }
-      // Fatal hata
-      if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
-        console.warn('[IPTV] HLS fatal media → recoverMediaError');
-        hls.recoverMediaError();
-        return;
-      }
-      hls.destroy(); S.hls=null;
-      if(src!==url){
-        toast('🔄 Direkt deneniyor…');
-        tryHlsDirect(url);
-      } else {
-        tryMpegts(src);
-      }
-    });
-  }
-
-  // ── STRATEJI 1b: HLS.js proxysiz ───────────────────
-  function tryHlsDirect(src){
-    if(stale()) return;
-    if(typeof Hls==='undefined'||!Hls.isSupported()){ tryMpegts(src); return; }
-    console.warn('[IPTV] HLS.js direkt →', src);
-    var hls=new Hls({
-      enableWorker:true, lowLatencyMode:false,
-      maxBufferLength:30, maxMaxBufferLength:60, backBufferLength:0,
-      manifestLoadingTimeOut:8000, manifestLoadingMaxRetry:1,
-      levelLoadingTimeOut:8000, fragLoadingTimeOut:10000,
-      startFragPrefetch:true, testBandwidth:false
-    });
-    S.hls=hls;
-    hls.loadSource(src);
-    hls.attachMedia(vid);
-    hls.on(Hls.Events.MANIFEST_PARSED,function(){
-      if(stale()){ hls.destroy(); S.hls=null; return; }
-      vid.play().catch(function(){});
     });
     hls.on(Hls.Events.ERROR,function(ev,d){
       if(stale()){ hls.destroy(); S.hls=null; return; }
@@ -1092,27 +1098,42 @@ function playUrl(url,ch){
         if(d.type===Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
         return;
       }
-      if(d.type===Hls.ErrorTypes.MEDIA_ERROR){ hls.recoverMediaError(); return; }
+      console.warn('[IPTV] HLS fatal:', d.type, d.details);
+      if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
+        hls.recoverMediaError(); return;
+      }
       hls.destroy(); S.hls=null;
-      tryMpegts(src);
+      // Proxy'li denedik → proxysiz dene (bazı sunucular proxy'yi reddediyor)
+      if(src!==url){
+        toast('🔄 Direkt deneniyor…');
+        tryHls(url, '');
+      } else if(proxy!==CF_PROXY && needsProxy(url)){
+        // CF proxy ile hiç denemedik → dene
+        toast('🔄 CF proxy deneniyor…');
+        tryHls(proxyWrap(url,CF_PROXY), CF_PROXY);
+      } else {
+        tryMpegts(src, proxy);
+      }
     });
   }
 
   // ── STRATEJI 2: mpegts.js ──────────────────────────
-  function tryMpegts(src){
+  function tryMpegts(src, proxy){
     if(stale()) return;
-    if(typeof mpegts==='undefined'||!mpegts.isSupported()){ tryNative(src); return; }
+    if(typeof mpegts==='undefined'||!mpegts.isSupported()){ tryNative(src,proxy); return; }
     console.warn('[IPTV] mpegts.js →', src);
     toast('🔄 MPEG-TS deneniyor…');
-    var type = src.indexOf('.flv')>=0 ? 'flv' : 'mpegts';
-    var player=mpegts.createPlayer({type:type,url:src,isLive:true},{
+    // mpegts proxy: URL'i sarmak yeterli (xhrSetup yok)
+    var pSrc = proxyWrap(src, proxy);
+    var type = pSrc.indexOf('.flv')>=0 ? 'flv' : 'mpegts';
+    var player=mpegts.createPlayer({type:type,url:pSrc,isLive:true},{
       enableWorker: true,
       liveBufferLatencyChasing: true,
-      liveBufferLatencyMaxLatency: 10,  // DÜZELT8
-      liveBufferLatencyMinRemain: 2,    // DÜZELT8
-      lazyLoadMaxDuration: 3*60,
+      liveBufferLatencyMaxLatency: 10,
+      liveBufferLatencyMinRemain: 2,
+      lazyLoadMaxDuration: 180,
       lazyLoadRecoverDuration: 30,
-      deferLoadAfterSourceOpen: false   // hızlı başlangıç
+      deferLoadAfterSourceOpen: false
     });
     S.mpegts=player;
     player.attachMediaElement(vid);
@@ -1120,28 +1141,28 @@ function playUrl(url,ch){
     player.play()
       .then(function(){
         if(stale()){ player.destroy(); S.mpegts=null; return; }
-        console.warn('[IPTV] mpegts OK');
+        console.warn('[IPTV] ✅ mpegts OK');
       })
       .catch(function(e){
         if(stale()) return;
-        console.warn('[IPTV] mpegts play() hata:', e.message);
+        console.warn('[IPTV] mpegts hata:', e.message);
         player.destroy(); S.mpegts=null;
-        tryNative(src);
+        tryNative(src, proxy);
       });
     player.on(mpegts.Events.ERROR,function(et,ed){
       if(stale()) return;
-      console.warn('[IPTV] mpegts hata:', et, ed);
+      console.warn('[IPTV] mpegts err:', et, ed);
       player.destroy(); S.mpegts=null;
-      toast('🔄 Direkt oynatma deneniyor…');
-      if(src!==url) tryNative(url);
-      else tryNative(src);
+      if(src!==url) tryNative(url,'');
+      else tryNative(src, proxy);
     });
   }
 
   // ── STRATEJI 3: Native <video> ──────────────────────
-  function tryNative(src){
+  function tryNative(src, proxy){
     if(stale()) return;
-    console.warn('[IPTV] Native →', src);
+    var pSrc = proxyWrap(src, proxy);
+    console.warn('[IPTV] Native →', pSrc);
     toast('🔄 Tarayıcı ile deneniyor…');
     showLoad(true);
     vid.pause();
@@ -1150,73 +1171,44 @@ function playUrl(url,ch){
     function onCanPlay(){
       if(stale()||played) return; played=true;
       clearTimeout(S.loadTimer);
-      console.warn('[IPTV] Native canplay OK');
       vid.play().catch(function(){});
     }
     function onErr(){
       if(stale()) return;
-      var code = vid.error ? vid.error.code : '?';
-      var msg  = vid.error ? vid.error.message : '';
-      console.warn('[IPTV] Native hata kod:'+code, msg, src);
+      var code=vid.error?vid.error.code:'?';
+      console.warn('[IPTV] Native hata:', code, pSrc);
       clearTimeout(S.loadTimer);
       showLoad(false);
-      if(src!==url){ toast('🔄 Proxysiz deneniyor…'); tryNativeDirect(url); }
-      else { toast('⚠️ Açılamadı (hata '+code+')'); }
+      if(pSrc!==url){
+        toast('🔄 Proxysiz deneniyor…');
+        tryNative(url,'');
+      } else if(proxy!==CF_PROXY && needsProxy(url)){
+        tryNative(url, CF_PROXY);
+      } else {
+        toast('⚠️ Açılamadı (hata '+code+')');
+      }
     }
-    vid.addEventListener('canplay', onCanPlay, {once:true});
-    vid.addEventListener('error',   onErr,     {once:true});
-    vid.src=src;
-    vid.load();
-    // DÜZELT7: timeout sadece tamamen cevapsız kanallar için, 15 sn
-    S.loadTimer=setTimeout(function(){
-      if(stale()||played) return;
-      vid.removeEventListener('canplay',onCanPlay);
-      vid.removeEventListener('error',onErr);
-      showLoad(false);
-      if(src!==url){ tryNativeDirect(url); }
-      else { toast('⚠️ Zaman aşımı — kanal cevap vermedi'); }
-    },15000);
-  }
-
-  // ── STRATEJI 3b: Native proxysiz (son şans) ────────
-  function tryNativeDirect(src){
-    if(stale()) return;
-    console.warn('[IPTV] Native direkt →', src);
-    showLoad(true);
-    var played=false;
-    function onCanPlay(){
-      if(stale()||played) return; played=true;
-      clearTimeout(S.loadTimer);
-      vid.play().catch(function(){});
-    }
-    function onErr(){
-      if(stale()) return;
-      var code = vid.error ? vid.error.code : '?';
-      clearTimeout(S.loadTimer);
-      showLoad(false);
-      toast('⚠️ Bu kanal açılamadı (hata '+code+')');
-      console.warn('[IPTV] Tüm stratejiler başarısız. URL:', url);
-    }
-    vid.addEventListener('canplay', onCanPlay, {once:true});
-    vid.addEventListener('error',   onErr,     {once:true});
-    vid.src=src;
+    vid.addEventListener('canplay',onCanPlay,{once:true});
+    vid.addEventListener('error',onErr,{once:true});
+    vid.src=pSrc;
     vid.load();
     S.loadTimer=setTimeout(function(){
       if(stale()||played) return;
       vid.removeEventListener('canplay',onCanPlay);
       vid.removeEventListener('error',onErr);
       showLoad(false);
-      toast('⚠️ Zaman aşımı');
+      if(pSrc!==url) tryNative(url,'');
+      else toast('⚠️ Zaman aşımı — kanal cevap vermedi');
     },15000);
   }
 
   // ── Başlangıç stratejisi ────────────────────────────
-  if(isMpegTs && !isHls){
-    tryMpegts(proxyUrl);
+  if(isMpegTs){
+    tryMpegts(url, activeProxy);
   } else {
-    tryHls(proxyUrl);
+    // HLS veya belirsiz → HLS.js + segment proxy
+    tryHls(manifestUrl, activeProxy);
   }
-
   showCtrl();
 }
 function prevCh(){
