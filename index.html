@@ -321,11 +321,11 @@ html,body{height:100%;background:var(--bg);color:var(--text);
       </div>
       <div class="field">
         <label>MAC Adresi</label>
-        <input id="st-mac" type="text" placeholder="00:1A:79:XX:XX:XX" autocomplete="off"/>
+        <input id="st-mac" type="text" placeholder="00:1A:79:xx:xx:xx" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"/>
       </div>
       <div class="field">
         <label>Proxy URL (CORS için)</label>
-        <input id="st-proxy" type="url" placeholder="https://player.deindigitalerhelfer.workers.dev/" autocomplete="off" inputmode="url"/>
+        <input id="st-proxy" type="url" placeholder="https://cors-proxy.deindigitalerhelfer.workers.dev/" autocomplete="off" inputmode="url"/>
       </div>
       <div class="proxy-note">⚠️ Tarayıcıdan Stalker portala CORS engeli çıkabilir. Cloudflare Workers proxy önerilir.</div>
       <button class="btn-big btn-accent" onclick="connectStalker()">▶ Bağlan</button>
@@ -487,7 +487,7 @@ window.onload=function(){
   vid.addEventListener('pause',function(){ document.getElementById('play-btn').textContent='▶'; });
   vid.addEventListener('error',function(){ showLoad(false); toast('⚠️ Oynatma hatası'); });
 
-  document.getElementById('st-mac').addEventListener('input',function(){ this.value=this.value.toUpperCase(); });
+  // MAC: sadece görsel format, büyük/küçük serbest
 
   // Drag & drop
   var da=document.getElementById('drop-area');
