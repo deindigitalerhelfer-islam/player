@@ -16,6 +16,8 @@
 
 <!-- HLS.js -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.4.12/hls.min.js"></script>
+<!-- mpegts.js (MPEG-TS / HTTP-FLV stream desteği) -->
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
 <!-- QR Code -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 
@@ -423,7 +425,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 // ══════════════════════════════════════════
 var S={
   mode:'m3u', channels:[], filtered:[], genres:[],
-  curIdx:-1, hls:null,
+  curIdx:-1, hls:null, mpegts:null,
   favs:JSON.parse(localStorage.getItem('iptv_favs')||'[]'),
   pin:localStorage.getItem('iptv_pin')||'',
   pinBuf:'', pinMode:'set', pinCb:null,
@@ -511,6 +513,7 @@ function goConnect(){ stopPlayer(); showScreen('screen-connect'); }
 function goChannels(){ stopPlayer(); showScreen('screen-channels'); }
 function stopPlayer(){
   if(S.hls){ S.hls.destroy(); S.hls=null; }
+  if(S.mpegts){ S.mpegts.destroy(); S.mpegts=null; }
   document.getElementById('video').src='';
 }
 
@@ -714,42 +717,94 @@ function playUrl(url,ch){
   document.getElementById('player-epg').textContent=ch.epgNow?'▶ '+ch.epgNow:'';
   showLoad(true);
   var vid=document.getElementById('video');
-  if(S.hls){ S.hls.destroy(); S.hls=null; }
 
-  // Stream URL proxy üzerinden geçir (CORS engeli aşmak için)
+  // Önceki player'ları temizle
+  if(S.hls){ S.hls.destroy(); S.hls=null; }
+  if(S.mpegts){ S.mpegts.destroy(); S.mpegts=null; }
+  vid.src='';
+
   var proxy=S._p||'';
   var streamUrl=(proxy&&!url.startsWith('blob:'))?proxy+encodeURIComponent(url):url;
 
-  function tryNative(u){
-    vid.src=u;
-    vid.play().catch(function(){
-      if(u!==url){ vid.src=url; vid.play().catch(function(){}); }
-    });
-  }
+  // URL tipini tahmin et
+  var isHls = url.indexOf('.m3u8')>=0 || url.indexOf('m3u8')>=0;
+  var isMpegTs = url.indexOf('.ts')>=0 || url.indexOf('/stream')>=0 || url.indexOf('livestream')>=0;
 
-  if(Hls.isSupported()){
-    var hls=new Hls({enableWorker:true,lowLatencyMode:true});
+  toast('▶ Yükleniyor…');
+
+  // STRATEJI 1: HLS.js (m3u8 için)
+  function tryHls(src){
+    if(!Hls.isSupported()) { tryNative(src); return; }
+    var hls=new Hls({
+      enableWorker:true, lowLatencyMode:true,
+      manifestLoadingTimeOut:15000, levelLoadingTimeOut:15000,
+    });
     S.hls=hls;
-    hls.loadSource(streamUrl);
+    hls.loadSource(src);
     hls.attachMedia(vid);
-    hls.on(Hls.Events.MANIFEST_PARSED,function(){ vid.play().catch(function(){}); });
+    hls.on(Hls.Events.MANIFEST_PARSED,function(){
+      vid.play().catch(function(){});
+      showLoad(false);
+    });
     hls.on(Hls.Events.ERROR,function(e,d){
       if(d.fatal){
-        showLoad(false);
-        if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&streamUrl!==url){
-          // Proxy başarısız → direkt dene
-          toast('Direkt bağlantı deneniyor…');
-          hls.destroy(); S.hls=null;
-          tryNative(url);
+        hls.destroy(); S.hls=null;
+        // STRATEJI 2: mpegts.js dene
+        if(typeof mpegts!=='undefined' && mpegts.isSupported()){
+          toast('MPEG-TS deneniyor…');
+          tryMpegts(src);
         } else {
-          toast('⚠️ Yayın açılamadı');
+          // STRATEJI 3: Native video
+          toast('Direkt oynatma deneniyor…');
+          tryNative(url);
         }
       }
     });
+  }
+
+  // STRATEJI 2: mpegts.js (MPEG-TS / HTTP-FLV için)
+  function tryMpegts(src){
+    if(typeof mpegts==='undefined'||!mpegts.isSupported()){ tryNative(src); return; }
+    var type = src.indexOf('.flv')>=0 ? 'flv' : 'mpegts';
+    var player=mpegts.createPlayer({type:type,url:src,isLive:true},{
+      enableWorker:true, liveBufferLatencyChasing:true,
+    });
+    S.mpegts=player;
+    player.attachMediaElement(vid);
+    player.load();
+    player.play().then(function(){ showLoad(false); })
+      .catch(function(){ player.destroy(); S.mpegts=null; tryNative(url); });
+    player.on(mpegts.Events.ERROR,function(){
+      player.destroy(); S.mpegts=null;
+      toast('Direkt oynatma deneniyor…');
+      tryNative(url);
+    });
+  }
+
+  // STRATEJI 3: Native <video> (tarayıcı kendi halleder)
+  function tryNative(src){
+    showLoad(true);
+    vid.src=src;
+    vid.load();
+    var played=false;
+    vid.oncanplay=function(){ if(!played){ played=true; vid.play().catch(function(){}); showLoad(false); } };
+    vid.onerror=function(){
+      showLoad(false);
+      if(src!==url){ vid.src=url; vid.load(); } // proxy başarısız → direkt
+      else { toast('⚠️ Bu kanal açılamadı — başka kanal deneyin'); }
+    };
+    setTimeout(function(){ if(!played){ showLoad(false); } },8000);
+  }
+
+  // Başlangıç stratejisi seç
+  if(isHls || !isMpegTs){
+    tryHls(streamUrl);
+  } else if(typeof mpegts!=='undefined'&&mpegts.isSupported()){
+    tryMpegts(streamUrl);
   } else {
-    // Safari/iOS native HLS veya diğer formatlar
     tryNative(streamUrl);
   }
+
   showCtrl();
 }
 function prevCh(){
