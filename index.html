@@ -19,7 +19,7 @@
 <!-- mpegts.js (MPEG-TS / HTTP-FLV stream desteği) -->
 <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
 <!-- QR Code -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
 
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -239,8 +239,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 
   <!-- QR Kod -->
   <div style="text-align:center">
-    <div class="qr-box" id="qr-container"></div>
-    <div class="qr-label">📷 QR ile telefona aç / paylaş</div>
+    <div class="qr-box">
+      <img id="qr-img" src="" width="160" height="160" alt="QR Kod" style="display:block"/>
+    </div>
+    <div class="qr-label">📷 QR tarat → telefonda aç → Ana Ekrana Ekle</div>
   </div>
 
   <div class="install-btns">
@@ -462,17 +464,12 @@ if(isIOS&&!isStandalone){
 if(isStandalone){ showScreen('screen-connect'); }
 
 // ══════════════════════════════════════════
-// QR KOD
+// QR KOD — qrserver.com API (güvenilir)
 // ══════════════════════════════════════════
 window.onload=function(){
-  var url=window.location.href;
-  try{
-    new QRCode(document.getElementById('qr-container'),{
-      text:url, width:140, height:140,
-      colorDark:'#000000', colorLight:'#ffffff',
-      correctLevel:QRCode.CorrectLevel.M
-    });
-  }catch(e){}
+  var pageUrl=window.location.href.split('?')[0].split('#')[0];
+  var qrSrc='https://api.qrserver.com/v1/create-qr-code/?size=160x160&margin=4&data='+encodeURIComponent(pageUrl);
+  document.getElementById('qr-img').src=qrSrc;
 
   // Kayıtlı değerler
   var sm=localStorage.getItem('iptv_m3u');
