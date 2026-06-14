@@ -1057,8 +1057,7 @@ function playUrl(url,ch){
   if(S.mpegts){ try{ S.mpegts.destroy(); }catch(e){} S.mpegts=null; }
   vid.pause();
   vid.removeAttribute('src');
-
-  // ── DÜZELT 1: Otomatik proxy seç ───────────────────
+  vid.load(); // zorunlu — eski stream tamamen temizlenir, siyah ekran önlenir
   // Stalker kanalları: S._p (portal proxy)
   // M3U kanalları: kullanıcı proxy varsa onu, yoksa http→https durumunda CF_PROXY
   var userProxy = ch.cmd ? (S._p||'') : (S._m3uProxy||S._p||'');
@@ -1167,6 +1166,7 @@ function playUrl(url,ch){
     showLoad(true);
     vid.pause();
     vid.removeAttribute('src');
+    vid.load();
     var played=false;
     function onCanPlay(){
       if(stale()||played) return; played=true;
