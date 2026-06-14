@@ -715,12 +715,41 @@ function playUrl(url,ch){
   showLoad(true);
   var vid=document.getElementById('video');
   if(S.hls){ S.hls.destroy(); S.hls=null; }
+
+  // Stream URL proxy üzerinden geçir (CORS engeli aşmak için)
+  var proxy=S._p||'';
+  var streamUrl=(proxy&&!url.startsWith('blob:'))?proxy+encodeURIComponent(url):url;
+
+  function tryNative(u){
+    vid.src=u;
+    vid.play().catch(function(){
+      if(u!==url){ vid.src=url; vid.play().catch(function(){}); }
+    });
+  }
+
   if(Hls.isSupported()){
-    var hls=new Hls({enableWorker:true,lowLatencyMode:true}); S.hls=hls;
-    hls.loadSource(url); hls.attachMedia(vid);
+    var hls=new Hls({enableWorker:true,lowLatencyMode:true});
+    S.hls=hls;
+    hls.loadSource(streamUrl);
+    hls.attachMedia(vid);
     hls.on(Hls.Events.MANIFEST_PARSED,function(){ vid.play().catch(function(){}); });
-    hls.on(Hls.Events.ERROR,function(e,d){ if(d.fatal){ showLoad(false); toast('⚠️ HLS hatası'); } });
-  } else { vid.src=url; vid.play().catch(function(){}); }
+    hls.on(Hls.Events.ERROR,function(e,d){
+      if(d.fatal){
+        showLoad(false);
+        if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&streamUrl!==url){
+          // Proxy başarısız → direkt dene
+          toast('Direkt bağlantı deneniyor…');
+          hls.destroy(); S.hls=null;
+          tryNative(url);
+        } else {
+          toast('⚠️ Yayın açılamadı');
+        }
+      }
+    });
+  } else {
+    // Safari/iOS native HLS veya diğer formatlar
+    tryNative(streamUrl);
+  }
   showCtrl();
 }
 function prevCh(){
