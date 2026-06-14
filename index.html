@@ -139,8 +139,21 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 .search-bar select{padding:9px 8px;background:var(--card2);border:1.5px solid var(--border);
   border-radius:var(--r);color:var(--text);font-size:12px;outline:none;max-width:120px}
 
-.ch-list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.ch-list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;position:relative}
 .ch-list::-webkit-scrollbar{display:none}
+
+/* Virtual scroll viewport */
+.vscroll-inner{position:relative;width:100%}
+
+/* Grup başlığı */
+.ch-group-hdr{
+  padding:6px 14px 4px;
+  font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+  color:var(--accent2);background:var(--bg2);
+  border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:2;
+  display:flex;align-items:center;gap:6px;
+}
 
 .ch-item{display:flex;align-items:center;gap:10px;padding:11px 14px;
   border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer}
@@ -237,16 +250,16 @@ html,body{height:100%;background:var(--bg);color:var(--text);
   <div class="install-title">IPTV Player</div>
   <div class="install-sub">M3U · Stalker Portal · Ücretsiz · Reklamsız</div>
 
-  <!-- QR Kod -->
+  <!-- QR Kod (JS ile doldurulur) -->
   <div style="text-align:center">
-    <div class="qr-box" id="qr-container"></div>
+    <div class="qr-box" id="qr-container" style="min-width:140px;min-height:140px"></div>
     <div class="qr-label">📷 QR ile telefona aç / paylaş</div>
   </div>
 
   <div class="install-btns">
     <!-- Android Chrome install butonu -->
     <button class="btn-install primary" id="btn-install-pwa" style="display:none">
-      📲 Uygulamayı Yükle (Android)
+      📲 Uygulamayı Yükle (Android/Chrome)
     </button>
 
     <!-- iOS talimat butonu -->
@@ -434,7 +447,7 @@ var S={
   favs:JSON.parse(localStorage.getItem('iptv_favs')||'[]'),
   pin:localStorage.getItem('iptv_pin')||'',
   pinBuf:'', pinMode:'set', pinCb:null,
-  ctrlT:null, loadTimer:null, deferredPrompt:null,
+  ctrlT:null, loadTimer:null, stallTimer:null, deferredPrompt:null,
   fileContent:null, fileName:'',
   _m3uProxy:localStorage.getItem('iptv_m3u_proxy')||''
 };
@@ -442,18 +455,61 @@ var S={
 // ══════════════════════════════════════════
 // PWA INSTALL
 // ══════════════════════════════════════════
+// beforeinstallprompt'u ERKEN yakala (window.onload bekleme)
 window.addEventListener('beforeinstallprompt',function(e){
-  e.preventDefault(); S.deferredPrompt=e;
-  document.getElementById('btn-install-pwa').style.display='flex';
+  e.preventDefault();
+  S.deferredPrompt=e;
+  // Buton göster (DOM hazır olduğunda da çalışır)
+  var btn=document.getElementById('btn-install-pwa');
+  if(btn) btn.style.display='flex';
 });
 document.getElementById('btn-install-pwa').onclick=function(){
-  if(!S.deferredPrompt) return;
+  if(!S.deferredPrompt){ toast('Tarayıcınız yüklemeyi desteklemiyor'); return; }
   S.deferredPrompt.prompt();
   S.deferredPrompt.userChoice.then(function(r){
-    if(r.outcome==='accepted') toast('✅ Uygulama yüklendi!');
+    if(r.outcome==='accepted') toast('✅ Uygulama ana ekrana eklendi!');
+    else toast('ℹ️ Yükleme iptal edildi');
     S.deferredPrompt=null;
+    document.getElementById('btn-install-pwa').style.display='none';
   });
 };
+
+// Service Worker kaydı (PWA'nın gerçekten çalışması için)
+if('serviceWorker' in navigator){
+  window.addEventListener('load',function(){
+    // Inline SW — harici dosyaya gerek yok
+    var swCode=[
+      'var CACHE="iptv-v1";',
+      'var ASSETS=[];',
+      'self.addEventListener("install",function(e){',
+      '  self.skipWaiting();',
+      '});',
+      'self.addEventListener("activate",function(e){',
+      '  e.waitUntil(clients.claim());',
+      '});',
+      'self.addEventListener("fetch",function(e){',
+      '  if(e.request.method!=="GET") return;',
+      '  e.respondWith(',
+      '    caches.match(e.request).then(function(r){',
+      '      return r||fetch(e.request).then(function(nr){',
+      '        return caches.open(CACHE).then(function(c){',
+      '          try{c.put(e.request,nr.clone());}catch(err){}',
+      '          return nr;',
+      '        });',
+      '      }).catch(function(){ return r; });',
+      '    })',
+      '  );',
+      '});'
+    ].join('\n');
+    try{
+      var blob=new Blob([swCode],{type:'application/javascript'});
+      var swUrl=URL.createObjectURL(blob);
+      navigator.serviceWorker.register(swUrl).then(function(reg){
+        console.log('[SW] Kayıtlı');
+      }).catch(function(e){ console.warn('[SW] Hata:',e.message); });
+    }catch(e){ console.warn('[SW] Blob SW desteklenmiyor'); }
+  });
+}
 
 // iOS tespiti
 var isIOS=/iphone|ipad|ipod/i.test(navigator.userAgent)&&!window.MSStream;
@@ -468,19 +524,31 @@ if(isIOS&&!isStandalone){
 if(isStandalone){ showScreen('screen-connect'); }
 
 // ══════════════════════════════════════════
-// QR KOD
+// QR KOD (güvenilir init)
 // ══════════════════════════════════════════
-window.onload=function(){
+function initQR(){
+  var el=document.getElementById('qr-container');
+  if(!el||el.innerHTML.trim()) return; // zaten oluşturulmuş
   var url=window.location.href;
+  if(url.startsWith('file://')) url='https://iptv-player.app'; // file:// QR için fallback
   try{
-    new QRCode(document.getElementById('qr-container'),{
+    el.innerHTML='';
+    new QRCode(el,{
       text:url, width:140, height:140,
       colorDark:'#000000', colorLight:'#ffffff',
       correctLevel:QRCode.CorrectLevel.M
     });
-  }catch(e){}
+  }catch(e){ el.innerHTML='<div style="font-size:11px;color:#666;padding:10px">QR yüklenemedi</div>'; }
+}
+// QRCode kütüphanesi yüklenince çalıştır
+function waitQR(n){
+  if(typeof QRCode!=='undefined'){ initQR(); }
+  else if(n>0){ setTimeout(function(){ waitQR(n-1); },200); }
+}
+waitQR(20);
 
-  // Kayıtlı değerler
+// ── Kayıtlı değerler & video event'leri (DOM hazır olunca) ──
+document.addEventListener('DOMContentLoaded', function(){
   var sm=localStorage.getItem('iptv_m3u');
   var smp=localStorage.getItem('iptv_m3u_proxy');
   var ss=localStorage.getItem('iptv_stalker');
@@ -492,11 +560,51 @@ window.onload=function(){
     document.getElementById('st-proxy').value=o.proxy||''; }
 
   var vid=document.getElementById('video');
-  vid.addEventListener('waiting',function(){ showLoad(true); });
-  vid.addEventListener('playing',function(){ showLoad(false); document.getElementById('play-btn').textContent='⏸'; });
+  var _recoverCount=0; // Recovery sonsuz döngü önleyici
+  vid.addEventListener('waiting',function(){
+    showLoad(true);
+    clearTimeout(S.stallTimer);
+    S.stallTimer=setTimeout(function(){
+      if(vid.paused||vid.readyState<3){
+        if(_recoverCount<3){
+          _recoverCount++;
+          console.warn('[IPTV] waiting recovery #'+_recoverCount);
+          if(S.hls){ try{ S.hls.recoverMediaError(); }catch(e){} }
+          vid.play().catch(function(){});
+        } else {
+          // 3 denemeden sonra → HLS'i sıfırla ve yeniden yükle
+          console.warn('[IPTV] waiting max retry - HLS restart');
+          _recoverCount=0;
+          if(S.hls){
+            try{ S.hls.stopLoad(); S.hls.startLoad(-1); }catch(e){}
+          }
+          vid.play().catch(function(){});
+        }
+      }
+    },3000);
+  });
+  vid.addEventListener('playing',function(){
+    showLoad(false);
+    clearTimeout(S.stallTimer);
+    clearTimeout(S.loadTimer);
+    _recoverCount=0; // Başarılı oynatma → sayacı sıfırla
+    document.getElementById('play-btn').textContent='⏸';
+  });
+  vid.addEventListener('stalled',function(){
+    console.warn('[IPTV] stalled');
+    clearTimeout(S.stallTimer);
+    S.stallTimer=setTimeout(function(){
+      if(_recoverCount<3){
+        _recoverCount++;
+        if(S.hls){ try{ S.hls.recoverMediaError(); }catch(e){} }
+        vid.play().catch(function(){});
+      } else {
+        _recoverCount=0;
+        if(S.hls){ try{ S.hls.stopLoad(); S.hls.startLoad(-1); }catch(e){} }
+      }
+    },2000);
+  });
   vid.addEventListener('pause',function(){ document.getElementById('play-btn').textContent='▶'; });
-
-  // MAC: sadece görsel format, büyük/küçük serbest
 
   // Drag & drop
   var da=document.getElementById('drop-area');
@@ -506,7 +614,10 @@ window.onload=function(){
     e.preventDefault(); da.classList.remove('drag');
     var f=e.dataTransfer.files[0]; if(f) processFile(f);
   });
-};
+
+  // Virtual scroll event
+  document.getElementById('ch-list').addEventListener('scroll', vsOnScroll, {passive:true});
+});
 
 // ══════════════════════════════════════════
 // EKRAN YÖNETİMİ
@@ -522,6 +633,7 @@ function stopPlayer(){
   if(S.hls){ S.hls.destroy(); S.hls=null; }
   if(S.mpegts){ S.mpegts.destroy(); S.mpegts=null; }
   clearTimeout(S.loadTimer);
+  clearTimeout(S.stallTimer);
   var vid=document.getElementById('video');
   vid.pause();
   vid.removeAttribute('src');
@@ -668,56 +780,198 @@ function stalkerLink(cmd,tok){
 }
 
 // ══════════════════════════════════════════
+// OTOMATİK GRUPLAMA MOTORU
+// ══════════════════════════════════════════
+var GROUP_MAP = [
+  // Emoji + TR label + anahtar kelimeler (küçük harf)
+  ['📺','Ulusal Kanallar',    ['ulusal','milli','national','trt','kanal d','show tv','atv','fox','star tv','tv8','now tv','kanal 7','samanyolu','beyaz tv']],
+  ['📡','Haber Kanalları',    ['haber','news','cnn','ntv','tgrt','a haber','bloomberg','euronews','bbc','dw','al jazeera','france 24','arte','info','aktu']],
+  ['🎬','Sinema & Dizi',      ['sinema','cinema','film','movie','dizi','series','action','drama','komedie','comedy','thriller','bein movies','bein series','tivibu','digiturk film','gold film','aile','pembe']],
+  ['⚽','Spor Kanalları',     ['spor','sport','bein sport','tivibu sport','s sport','maci','maç','football','futbol','soccer','basket','nba','tennis','motor','formula']],
+  ['🧒','Çocuk Kanalları',    ['çocuk','kids','children','cartoon','disney','nickelodeon','boomerang','baby','toon','mini','junior','toddler']],
+  ['🎵','Müzik Kanalları',    ['müzik','music','kral','number one','pal','power','joy','radyo','radio','flash','hit','beat']],
+  ['🌍','Uluslararası',       ['de |','at |','ch |','deu','ger |','austria','schweiz','deutsch','german','austrian','swiss','orf','ard','zdf','rtl','sat.1','pro7','kabel','vox','n24','ntv de','servus','puls','3sat','sixx','super rtl']],
+  ['🇹🇷','Türkçe Kanallar',  ['tr |','tur |','turkey','türkiye','türk','turkish','trt','kanal','show','atv','fox tr','now tr','blu tv']],
+  ['🌍','Avrupa Kanalları',   ['fr |','fre |','france','tf1','m6','arte','canal','be |','nl |','it |','ita |','es |','esp |','pt |','pol |','pl |','se |','no |','dk |','fi |','hu |','ro |','bg |','hr |','sk |','cz |','rs |']],
+  ['🌏','Diğer Uluslararası', ['us |','uk |','gb |','en |','int |','arabic','arab','ar |','persian','farsi','ru |','rus |','ukr |']],
+  ['🔞','Yetişkin',           ['adult','erotic','xxx','18+','x-rated']],
+  ['📦','Diğer',              []]  // fallback
+];
+
+function autoGroup(ch){
+  var name = (ch.name||'').toLowerCase();
+  var grp  = (ch.group||'').toLowerCase();
+  var combined = grp + ' ' + name;
+  for(var i=0;i<GROUP_MAP.length-1;i++){
+    var keys=GROUP_MAP[i][2];
+    for(var k=0;k<keys.length;k++){
+      if(combined.indexOf(keys[k])>=0) return GROUP_MAP[i][0]+' '+GROUP_MAP[i][1];
+    }
+  }
+  // group-title varsa onu kullan (normalize et)
+  if(ch.group){
+    var g=ch.group.trim();
+    // "DE | Nachrichten" → "Nachrichten" gibi prefix temizle
+    g=g.replace(/^[A-Z]{2}\s*\|\s*/,'').trim();
+    if(g) return '📦 '+g;
+  }
+  return '📦 Diğer';
+}
+
+// ══════════════════════════════════════════
 // KANAL LİSTESİ
 // ══════════════════════════════════════════
 function finish(chs,label){
   if(!chs.length){ toast('Liste boş'); showScreen('screen-connect'); return; }
   S.channels=chs;
+
+  // Otomatik grup ata
+  chs.forEach(function(c){ c._grp=autoGroup(c); });
+
+  // Unique grupları topla ve sırala
   var groups={};
-  chs.forEach(function(c){ if(c.group) groups[c.group]=1; });
+  chs.forEach(function(c){ groups[c._grp]=1; });
   S.genres=Object.keys(groups).sort();
+
   var sel=document.getElementById('genre');
   sel.innerHTML='<option value="">Tümü</option><option value="__fav__">⭐ Favori</option>';
-  S.genres.forEach(function(g){ var o=document.createElement('option'); o.value=g; o.textContent=g; sel.appendChild(o); });
+  S.genres.forEach(function(g){
+    var o=document.createElement('option'); o.value=g; o.textContent=g; sel.appendChild(o);
+  });
   filterCh();
   toast('✅ '+chs.length+' kanal yüklendi');
   showScreen('screen-channels');
 }
+
 function filterCh(){
   var q=document.getElementById('search').value.trim().toLowerCase();
   var g=document.getElementById('genre').value;
   S.filtered=S.channels.filter(function(c){
-    if(g==='__fav__') return S.favs.includes(c.id);
-    if(g&&c.group!==g) return false;
-    if(q&&!c.name.toLowerCase().includes(q)) return false;
+    if(g==='__fav__') return S.favs.indexOf(c.id)>=0;
+    if(g&&c._grp!==g) return false;
+    if(q&&c.name.toLowerCase().indexOf(q)<0) return false;
     return true;
   });
-  renderList();
-}
-function renderList(){
-  document.getElementById('ch-count').textContent=S.filtered.length+' kanal';
-  var list=document.getElementById('ch-list');
-  if(!S.filtered.length){ list.innerHTML='<div class="list-empty"><span class="em">🔍</span>Sonuç bulunamadı</div>'; return; }
-  var html='';
-  S.filtered.forEach(function(c,i){
-    var fav=S.favs.includes(c.id);
-    var cur=S.curIdx>=0&&S.channels[S.curIdx]&&S.channels[S.curIdx].id===c.id;
-    var logo=c.logo?'<img class="ch-logo" src="'+c.logo+'" onerror="this.style.display=\'none\'" loading="lazy"/>':'<div class="ch-logo-ph">📺</div>';
-    html+='<div class="ch-item'+(cur?' playing':'')+'" onclick="selCh('+i+')">'
-      +'<span class="ch-num">'+(i+1)+'</span>'+logo
-      +'<div class="ch-info"><div class="ch-name">'+esc(c.name)+'</div>'+(c.epgNow?'<div class="ch-epg">▶ '+esc(c.epgNow)+'</div>':'')+'</div>'
-      +'<button class="ch-fav'+(fav?' on':'')+'" onclick="togFav(event,\''+c.id+'\')">'+(fav?'★':'☆')+'</button>'
-      +'</div>';
-  });
-  list.innerHTML=html;
+  // Gruba göre sırala, sonra isme göre
+  if(!g && !q){
+    S.filtered.sort(function(a,b){
+      if(a._grp<b._grp) return -1; if(a._grp>b._grp) return 1;
+      if(a.name<b.name) return -1; if(a.name>b.name) return 1;
+      return 0;
+    });
+  }
+  // Virtual scroll sıfırla
+  vsReset();
 }
 
 // ══════════════════════════════════════════
-// OYNATMA
+// VİRTUAL SCROLL
+// ══════════════════════════════════════════
+var VS={
+  ROW_H: 57,       // ch-item yüksekliği (px)
+  GRP_H: 30,       // grup başlığı yüksekliği (px)
+  BUFFER: 10,      // görünür alanın üstünde/altında extra satır
+  items: [],       // {type:'grp'|'ch', data, idx} flat liste
+  container: null,
+  inner: null,
+  lastGrp: null
+};
+
+function vsReset(){
+  document.getElementById('ch-count').textContent=S.filtered.length+' kanal';
+  var list=document.getElementById('ch-list');
+  if(!S.filtered.length){
+    list.innerHTML='<div class="list-empty"><span class="em">🔍</span>Sonuç bulunamadı</div>';
+    return;
+  }
+
+  // Flat item listesi oluştur (grup başlıkları + kanallar)
+  VS.items=[];
+  var lastGrp=null;
+  var g=document.getElementById('genre').value;
+  var q=document.getElementById('search').value.trim();
+  S.filtered.forEach(function(c,i){
+    // Sadece "Tümü" modunda ve arama yoksa grup başlığı ekle
+    if(!g && !q && c._grp!==lastGrp){
+      VS.items.push({type:'grp',data:c._grp});
+      lastGrp=c._grp;
+    }
+    VS.items.push({type:'ch',data:c,idx:i});
+  });
+
+  // Toplam yükseklik hesapla
+  var totalH=0;
+  VS.items.forEach(function(it){ totalH+=(it.type==='grp'?VS.GRP_H:VS.ROW_H); });
+
+  // Container'ı kur
+  list.innerHTML='';
+  var inner=document.createElement('div');
+  inner.className='vscroll-inner';
+  inner.style.height=totalH+'px';
+  list.appendChild(inner);
+  VS.container=list;
+  VS.inner=inner;
+  VS.offsets=[];
+  var off=0;
+  VS.items.forEach(function(it){
+    VS.offsets.push(off);
+    off+=(it.type==='grp'?VS.GRP_H:VS.ROW_H);
+  });
+
+  list.scrollTop=0;
+  vsRender();
+}
+
+function vsOnScroll(){
+  if(VS.inner) vsRender();
+}
+
+function vsRender(){
+  if(!VS.inner||!VS.items.length) return;
+  var scrollTop=VS.container.scrollTop;
+  var viewH=VS.container.clientHeight;
+  var start=scrollTop-VS.BUFFER*VS.ROW_H;
+  var end=scrollTop+viewH+VS.BUFFER*VS.ROW_H;
+
+  // Görünür item'ları bul
+  var first=-1,last=-1;
+  for(var i=0;i<VS.offsets.length;i++){
+    if(VS.offsets[i]+VS.ROW_H>=start && first<0) first=i;
+    if(VS.offsets[i]<=end) last=i;
+  }
+  if(first<0) first=0;
+  if(last<0) last=VS.items.length-1;
+
+  // Sadece görünür item'ları DOM'a yaz
+  var html='';
+  for(var j=first;j<=last;j++){
+    var it=VS.items[j];
+    var top=VS.offsets[j];
+    if(it.type==='grp'){
+      html+='<div class="ch-group-hdr" style="position:absolute;top:'+top+'px;left:0;right:0;height:'+VS.GRP_H+'px">'+esc(it.data)+'</div>';
+    } else {
+      var c=it.data, i2=it.idx;
+      var fav=S.favs.indexOf(c.id)>=0;
+      var cur=S.curIdx>=0&&S.channels[S.curIdx]&&S.channels[S.curIdx].id===c.id;
+      var logo=c.logo?'<img class="ch-logo" src="'+c.logo+'" onerror="this.style.display=\'none\'" loading="lazy"/>':'<div class="ch-logo-ph">📺</div>';
+      html+='<div class="ch-item'+(cur?' playing':'')+'" style="position:absolute;top:'+top+'px;left:0;right:0;height:'+VS.ROW_H+'px" onclick="selCh('+i2+')">'
+        +'<span class="ch-num">'+(i2+1)+'</span>'+logo
+        +'<div class="ch-info"><div class="ch-name">'+esc(c.name)+'</div>'
+        +(c._grp&&(document.getElementById('genre').value||document.getElementById('search').value.trim())?'<div class="ch-epg">'+esc(c._grp)+'</div>':'')
+        +'</div>'
+        +'<button class="ch-fav'+(fav?' on':'')+'" onclick="togFav(event,\''+esc(c.id)+'\')">'+(fav?'★':'☆')+'</button>'
+        +'</div>';
+    }
+  }
+  VS.inner.innerHTML=html;
+}
+
+function renderList(){ vsReset(); }
 // ══════════════════════════════════════════
 function selCh(i){
   var ch=S.filtered[i]; if(!ch) return;
   S.curIdx=S.channels.indexOf(ch);
+  localStorage.setItem('iptv_last',JSON.stringify({id:ch.id,name:ch.name}));
   if(ch.cmd&&!ch.url){
     showScreen('screen-loading'); setLD('Bağlantı alınıyor…',ch.name);
     stalkerLink(ch.cmd,ch._tok).then(function(url){
@@ -725,8 +979,8 @@ function selCh(i){
       ch.url=url; playUrl(url,ch);
     }).catch(function(){ toast('⚠️ Hata'); showScreen('screen-channels'); });
   } else if(ch.url){ playUrl(ch.url,ch); }
-  localStorage.setItem('iptv_last',JSON.stringify({id:ch.id,name:ch.name}));
-  renderList();
+  // renderList'i geciktir — kanal geçiş hızını artırır
+  setTimeout(renderList,100);
 }
 function playUrl(url,ch){
   showScreen('screen-player');
@@ -735,56 +989,77 @@ function playUrl(url,ch){
   showLoad(true);
   var vid=document.getElementById('video');
 
-  // Önceki player'ları ve timer'ları temizle
-  if(S.hls){ S.hls.destroy(); S.hls=null; }
-  if(S.mpegts){ S.mpegts.destroy(); S.mpegts=null; }
+  // ── Hızlı temizlik (kanal geçişini hızlandırır) ────
   clearTimeout(S.loadTimer);
+  clearTimeout(S.stallTimer);
+  if(S.hls){ S.hls.destroy(); S.hls=null; }
+  if(S.mpegts){ try{ S.mpegts.destroy(); }catch(e){} S.mpegts=null; }
   vid.pause();
   vid.removeAttribute('src');
-  vid.load();
+  // vid.load() çağırmıyoruz — gereksiz network flush'u önler, geçişi hızlandırır
 
-  // Proxy seç: Stalker kanalları S._p, M3U kanalları S._m3uProxy
   var proxy = (ch.cmd ? (S._p||'') : (S._m3uProxy||S._p||''));
-
-  // URL tipini tahmin et (orijinal URL'ye bak, proxy'ye değil)
   var lo = url.toLowerCase();
   var isHls    = lo.indexOf('.m3u8')>=0 || lo.indexOf('hls')>=0;
   var isMpegTs = lo.indexOf('.ts')>=0 || lo.indexOf('mpegts')>=0 || lo.indexOf('.flv')>=0;
-  // .m3u8 yoksa ve .ts de yoksa → muhtemelen HLS veya native (ağırlıklı HLS dene)
-
   var proxyUrl = (proxy && !url.startsWith('blob:')) ? proxy + encodeURIComponent(url) : url;
 
-  console.warn('[IPTV] Oynatılıyor:', url);
-  console.warn('[IPTV] Proxy:', proxy||'(yok)');
-  console.warn('[IPTV] Stream URL:', proxyUrl);
+  // Geçerli kanal ID'sini işaretle — eski async callback'ler iptal edilsin
+  var myId = (S._playId||0)+1; S._playId=myId;
+  function stale(){ return S._playId!==myId; }
 
+  console.warn('[IPTV] #'+myId+' Oynatılıyor:', url, '| Proxy:', proxy||'(yok)');
   toast('▶ Bağlanılıyor…');
 
   // ── STRATEJI 1: HLS.js ─────────────────────────────
   function tryHls(src){
+    if(stale()) return;
     if(typeof Hls==='undefined'||!Hls.isSupported()){ tryMpegts(src); return; }
-    console.warn('[IPTV] Strateji 1: HLS.js →', src);
+    console.warn('[IPTV] HLS.js →', src);
     var hls=new Hls({
-      enableWorker:true, lowLatencyMode:true,
-      manifestLoadingTimeOut:12000, levelLoadingTimeOut:12000,
-      fragLoadingTimeOut:20000
+      enableWorker: true,
+      lowLatencyMode: false,          // DÜZELT5: kapatıldı — live stream'de underrun yaratıyor
+      maxBufferLength: 30,            // DÜZELT5: 30 saniyelik buffer
+      maxMaxBufferLength: 60,         // DÜZELT5: max 60 saniye
+      backBufferLength: 0,            // belleği boşalt
+      maxBufferSize: 30*1000*1000,    // 30 MB
+      manifestLoadingTimeOut: 8000,   // DÜZELT7: daha kısa → hızlı fallback
+      manifestLoadingMaxRetry: 2,
+      levelLoadingTimeOut: 8000,
+      levelLoadingMaxRetry: 2,
+      fragLoadingTimeOut: 10000,
+      fragLoadingMaxRetry: 3,
+      startFragPrefetch: true,        // DÜZELT: ilk fragment önceden çek
+      testBandwidth: false
     });
     S.hls=hls;
     hls.loadSource(src);
     hls.attachMedia(vid);
     hls.on(Hls.Events.MANIFEST_PARSED,function(){
+      if(stale()){ hls.destroy(); S.hls=null; return; }
       console.warn('[IPTV] HLS manifest OK');
-      vid.play().catch(function(e){ console.warn('[IPTV] play() reddedildi:',e.message); });
-      showLoad(false);
+      vid.play().catch(function(e){ console.warn('[IPTV] play() red:',e.message); });
     });
     hls.on(Hls.Events.ERROR,function(ev,d){
+      if(stale()){ hls.destroy(); S.hls=null; return; }
       console.warn('[IPTV] HLS hata:', d.type, d.details, 'fatal:', d.fatal);
-      if(!d.fatal) return;
+      if(!d.fatal){
+        // DÜZELT6: fatal olmayan buffer/network hatası → recovery dene
+        if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
+          console.warn('[IPTV] HLS media error recovery');
+          hls.recoverMediaError();
+        }
+        return;
+      }
+      // Fatal hata
+      if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
+        console.warn('[IPTV] HLS fatal media → recoverMediaError');
+        hls.recoverMediaError();
+        return;
+      }
       hls.destroy(); S.hls=null;
-      // Proxy'li denedik, şimdi proxysiz deneyelim
       if(src!==url){
-        console.warn('[IPTV] HLS proxy başarısız → proxysiz HLS deneniyor');
-        toast('🔄 Direkt bağlantı deneniyor…');
+        toast('🔄 Direkt deneniyor…');
         tryHlsDirect(url);
       } else {
         tryMpegts(src);
@@ -794,48 +1069,70 @@ function playUrl(url,ch){
 
   // ── STRATEJI 1b: HLS.js proxysiz ───────────────────
   function tryHlsDirect(src){
+    if(stale()) return;
     if(typeof Hls==='undefined'||!Hls.isSupported()){ tryMpegts(src); return; }
-    console.warn('[IPTV] Strateji 1b: HLS.js direkt →', src);
-    var hls=new Hls({ enableWorker:true, lowLatencyMode:true, manifestLoadingTimeOut:12000 });
+    console.warn('[IPTV] HLS.js direkt →', src);
+    var hls=new Hls({
+      enableWorker:true, lowLatencyMode:false,
+      maxBufferLength:30, maxMaxBufferLength:60, backBufferLength:0,
+      manifestLoadingTimeOut:8000, manifestLoadingMaxRetry:1,
+      levelLoadingTimeOut:8000, fragLoadingTimeOut:10000,
+      startFragPrefetch:true, testBandwidth:false
+    });
     S.hls=hls;
     hls.loadSource(src);
     hls.attachMedia(vid);
     hls.on(Hls.Events.MANIFEST_PARSED,function(){
+      if(stale()){ hls.destroy(); S.hls=null; return; }
       vid.play().catch(function(){});
-      showLoad(false);
     });
     hls.on(Hls.Events.ERROR,function(ev,d){
-      if(!d.fatal) return;
+      if(stale()){ hls.destroy(); S.hls=null; return; }
+      if(!d.fatal){
+        if(d.type===Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+        return;
+      }
+      if(d.type===Hls.ErrorTypes.MEDIA_ERROR){ hls.recoverMediaError(); return; }
       hls.destroy(); S.hls=null;
-      console.warn('[IPTV] HLS direkt de başarısız → mpegts deneniyor');
       tryMpegts(src);
     });
   }
 
   // ── STRATEJI 2: mpegts.js ──────────────────────────
   function tryMpegts(src){
+    if(stale()) return;
     if(typeof mpegts==='undefined'||!mpegts.isSupported()){ tryNative(src); return; }
-    console.warn('[IPTV] Strateji 2: mpegts.js →', src);
+    console.warn('[IPTV] mpegts.js →', src);
     toast('🔄 MPEG-TS deneniyor…');
     var type = src.indexOf('.flv')>=0 ? 'flv' : 'mpegts';
     var player=mpegts.createPlayer({type:type,url:src,isLive:true},{
-      enableWorker:true, liveBufferLatencyChasing:true
+      enableWorker: true,
+      liveBufferLatencyChasing: true,
+      liveBufferLatencyMaxLatency: 10,  // DÜZELT8
+      liveBufferLatencyMinRemain: 2,    // DÜZELT8
+      lazyLoadMaxDuration: 3*60,
+      lazyLoadRecoverDuration: 30,
+      deferLoadAfterSourceOpen: false   // hızlı başlangıç
     });
     S.mpegts=player;
     player.attachMediaElement(vid);
     player.load();
     player.play()
-      .then(function(){ showLoad(false); console.warn('[IPTV] mpegts OK'); })
+      .then(function(){
+        if(stale()){ player.destroy(); S.mpegts=null; return; }
+        console.warn('[IPTV] mpegts OK');
+      })
       .catch(function(e){
+        if(stale()) return;
         console.warn('[IPTV] mpegts play() hata:', e.message);
         player.destroy(); S.mpegts=null;
         tryNative(src);
       });
     player.on(mpegts.Events.ERROR,function(et,ed){
+      if(stale()) return;
       console.warn('[IPTV] mpegts hata:', et, ed);
       player.destroy(); S.mpegts=null;
       toast('🔄 Direkt oynatma deneniyor…');
-      // Proxy'li denedik mi? Değilsek direkt URL'yi de dene
       if(src!==url) tryNative(url);
       else tryNative(src);
     });
@@ -843,85 +1140,80 @@ function playUrl(url,ch){
 
   // ── STRATEJI 3: Native <video> ──────────────────────
   function tryNative(src){
-    console.warn('[IPTV] Strateji 3: Native →', src);
+    if(stale()) return;
+    console.warn('[IPTV] Native →', src);
     toast('🔄 Tarayıcı ile deneniyor…');
     showLoad(true);
-
-    // Eski listener'ları temizle (once:true ile ekleneceğinden sorun olmaz)
     vid.pause();
     vid.removeAttribute('src');
-    vid.load();
-
     var played=false;
-
     function onCanPlay(){
-      if(played) return; played=true;
+      if(stale()||played) return; played=true;
+      clearTimeout(S.loadTimer);
       console.warn('[IPTV] Native canplay OK');
       vid.play().catch(function(){});
-      showLoad(false);
     }
-    function onErr(e){
+    function onErr(){
+      if(stale()) return;
       var code = vid.error ? vid.error.code : '?';
-      var msg  = vid.error ? vid.error.message : '?';
-      console.warn('[IPTV] Native hata kod:'+code, msg, 'src:', src);
-      showLoad(false);
+      var msg  = vid.error ? vid.error.message : '';
+      console.warn('[IPTV] Native hata kod:'+code, msg, src);
       clearTimeout(S.loadTimer);
-      if(src!==url){
-        // Proxy başarısız → proxysiz dene (son şans)
-        console.warn('[IPTV] Native proxy başarısız → proxysiz deneniyor');
-        toast('🔄 Proxysiz deneniyor…');
-        tryNativeDirect(url);
-      } else {
-        toast('⚠️ Açılamadı (hata '+code+') — başka kanal deneyin');
-      }
+      showLoad(false);
+      if(src!==url){ toast('🔄 Proxysiz deneniyor…'); tryNativeDirect(url); }
+      else { toast('⚠️ Açılamadı (hata '+code+')'); }
     }
-
     vid.addEventListener('canplay', onCanPlay, {once:true});
     vid.addEventListener('error',   onErr,     {once:true});
     vid.src=src;
     vid.load();
-
-    // 10 saniye timeout
+    // DÜZELT7: timeout sadece tamamen cevapsız kanallar için, 15 sn
     S.loadTimer=setTimeout(function(){
-      if(!played){
-        console.warn('[IPTV] Native timeout');
-        vid.removeEventListener('canplay', onCanPlay);
-        vid.removeEventListener('error',   onErr);
-        showLoad(false);
-        if(src!==url){ tryNativeDirect(url); }
-        else { toast('⚠️ Zaman aşımı — kanal cevap vermedi'); }
-      }
-    },10000);
+      if(stale()||played) return;
+      vid.removeEventListener('canplay',onCanPlay);
+      vid.removeEventListener('error',onErr);
+      showLoad(false);
+      if(src!==url){ tryNativeDirect(url); }
+      else { toast('⚠️ Zaman aşımı — kanal cevap vermedi'); }
+    },15000);
   }
 
   // ── STRATEJI 3b: Native proxysiz (son şans) ────────
   function tryNativeDirect(src){
-    console.warn('[IPTV] Strateji 3b: Native direkt →', src);
+    if(stale()) return;
+    console.warn('[IPTV] Native direkt →', src);
     showLoad(true);
     var played=false;
-    function onCanPlay(){ if(played) return; played=true; vid.play().catch(function(){}); showLoad(false); }
-    function onErr(){
-      var code = vid.error ? vid.error.code : '?';
-      showLoad(false);
+    function onCanPlay(){
+      if(stale()||played) return; played=true;
       clearTimeout(S.loadTimer);
+      vid.play().catch(function(){});
+    }
+    function onErr(){
+      if(stale()) return;
+      var code = vid.error ? vid.error.code : '?';
+      clearTimeout(S.loadTimer);
+      showLoad(false);
       toast('⚠️ Bu kanal açılamadı (hata '+code+')');
-      console.warn('[IPTV] Tüm stratejiler başarısız. URL:', src);
+      console.warn('[IPTV] Tüm stratejiler başarısız. URL:', url);
     }
     vid.addEventListener('canplay', onCanPlay, {once:true});
     vid.addEventListener('error',   onErr,     {once:true});
     vid.src=src;
     vid.load();
     S.loadTimer=setTimeout(function(){
-      if(!played){ vid.removeEventListener('canplay',onCanPlay); vid.removeEventListener('error',onErr); showLoad(false); toast('⚠️ Zaman aşımı'); }
-    },10000);
+      if(stale()||played) return;
+      vid.removeEventListener('canplay',onCanPlay);
+      vid.removeEventListener('error',onErr);
+      showLoad(false);
+      toast('⚠️ Zaman aşımı');
+    },15000);
   }
 
   // ── Başlangıç stratejisi ────────────────────────────
   if(isMpegTs && !isHls){
-    // Açıkça TS/FLV → mpegts.js ile başla
     tryMpegts(proxyUrl);
   } else {
-    // HLS veya belirsiz → HLS.js ile başla (en geniş kapsam)
     tryHls(proxyUrl);
   }
 
